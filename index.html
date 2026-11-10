@@ -1,0 +1,134 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Tensegrity Supplement Probe</title>
+<style>
+body{font-family:system-ui,Segoe UI,Helvetica,Arial;max-width:900px;margin:20px}
+textarea{width:100%;height:6em}
+input[type=text]{width:80%}
+pre{background:#f6f6f6;padding:10px}
+button{margin:6px}
+.filelist{margin:8px 0}
+</style>
+</head>
+<body>
+<h2>Tensegrity Supplement Probe</h2>
+<p>I am Marmalade, cataloguing files. Paste a supplement URL or choose a local ZIP/CSV/JSON/TSV. I'll look for machine-readable tables and try to normalize module pose/connectivity into CSV.</p>
+<p><input id=url type=text placeholder="Paste URL to ZIP or file (optional)"> <button id=fetch>Fetch</button></p>
+<p>Or pick local files: <input id=file type=file multiple></p>
+<div class=filelist id=filelist></div>
+<h3>Found machine-readable files</h3>
+<ul id=found></ul>
+<h3>Normalized CSV</h3>
+<pre id=out>Nothing yet.</pre>
+<h3>Provenance report</h3>
+<pre id=prov></pre>
+<script>
+// Minimal in-browser probe. No external libs.
+const fileInput = document.getElementById('file');
+const urlBox = document.getElementById('url');
+const fetchBtn = document.getElementById('fetch');
+const found = document.getElementById('found');
+const out = document.getElementById('out');
+const prov = document.getElementById('prov');
+
+function isTextLike(name){return /\.(csv|tsv|json)$/i.test(name);}
+
+function readFileAsArrayBuffer(f){return new Promise(r=>{let fr=new FileReader();fr.onload=()=>r(fr.result);fr.readAsArrayBuffer(f);});}
+function readFileAsText(f){return new Promise(r=>{let fr=new FileReader();fr.onload=()=>r(fr.result);fr.readAsText(f);});}
+
+async function handleFiles(list, sourceLabel){
+  found.innerHTML=''; out.textContent=''; prov.textContent='';
+  const entries=[];
+  for(const file of list){
+    const name=file.name||'(remote) '+file.url||'file';
+    if(isTextLike(name)){
+      const text=await readFileAsText(file);
+      entries.push({name, text, path:sourceLabel+'|'+name});
+    } else if(/\.zip$/i.test(name)){
+      // try in-browser unzip using simple JS unzip not available. Use streaming fallback: attempt to read central directory minimal parse not implemented.
+      // Instead, use the browser's built-in: create blob URL and try to let user extract externally. We'll still record provenance.
+      entries.push({name, text:null, path:sourceLabel+'|'+name});
+    } else {
+      // unknown
+      entries.push({name, text:null, path:sourceLabel+'|'+name});
+    }
+  }
+  // List
+  entries.forEach(e=>{
+    const li=document.createElement('li');
+    li.textContent = e.name + (e.text? ' — parsed as text' : ' — binary/unsupported (recorded)');
+    found.appendChild(li);
+  });
+  // Attempt normalization heuristically from entries with text
+  const tables=[];
+  for(const e of entries){
+    if(!e.text) continue;
+    let data=null;
+    try{ if(e.name.match(/\.json$/i)) data=JSON.parse(e.text);}catch(err){data=null}
+    if(data && Array.isArray(data)){
+      // try to convert array of objects to table
+      tables.push({name:e.name,rows:data});
+    } else {
+      // treat as delimited table
+      const delim = e.name.match(/\.tsv$/i)? '\t' : ',';
+      const lines = e.text.split(/\r?\n/).filter(l=>l.trim());
+      if(lines.length>0){
+        const headers = lines[0].split(/,|\t/).map(h=>h.trim().toLowerCase());
+        const rows = lines.slice(1).map(r=>{
+          const cols=r.split(/,|\t/);
+          const obj={}; headers.forEach((h,i)=>obj[h]=cols[i]&&cols[i].trim()); return obj;
+        });
+        tables.push({name:e.name,rows});
+      }
+    }
+  }
+  // Heuristic normalization: find id, x,y,z and connections
+  const normRows=[]; const provenance=[];
+  tables.forEach(t=>{
+    const rows=t.rows;
+    rows.forEach((r,idx)=>{
+      // try to find id
+      const id = r.id||r.name||r.index||r['module']||r['node']||r['node_id'];
+      const x = r.x||r.posx||r['x (mm)']||r['x_mm'];
+      const y = r.y||r.posy||r['y (mm)']||r['y_mm'];
+      const z = r.z||r.posz||r['z (mm)']||r['z_mm'];
+      const conn = r.conn||r.connections||r.links||r['connected_to']||r.connection;
+      if(id || x||y||z||conn){
+        normRows.push({id:id||'',x:x||'',y:y||'',z:z||'',conn:conn||''});
+        provenance.push({file:t.name,row:idx+1,fields:Object.keys(r)});
+      }
+    });
+  });
+  if(normRows.length===0){ out.textContent='No recognizable module pose/connectivity rows found by heuristic.'; }
+  else{
+    // build CSV
+    const header='id,x,y,z,conn';
+    const csv = [header].concat(normRows.map(r=>[r.id,r.x,r.y,r.z,JSON.stringify(r.conn)].join(','))).join('\n');
+    out.textContent=csv;
+    prov.textContent = 'Provenance:\n'+provenance.map(p=>`${p.file} row ${p.row} fields: ${p.fields.join(',')}`).join('\n');
+  }
+}
+
+fileInput.addEventListener('change',async e=>{
+  const files = Array.from(e.target.files);
+  await handleFiles(files,'local');
+});
+
+fetchBtn.addEventListener('click',async ()=>{
+  const url = urlBox.value.trim(); if(!url) return alert('Paste a URL or choose files');
+  try{
+    const resp = await fetch(url);
+    if(!resp.ok) throw new Error('Fetch failed: '+resp.status);
+    const ct = resp.headers.get('content-type')||'';
+    const ab = await resp.arrayBuffer();
+    const name = url.split('/').pop().split('?')[0] || 'download';
+    const blob = new Blob([ab],{type:ct});
+    const file = new File([blob], name);
+    await handleFiles([file],'remote:'+url);
+  }catch(err){ alert('Could not fetch: '+err.message); }
+});
+</script>
+</body>
+</html>
